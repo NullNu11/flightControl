@@ -1,0 +1,35 @@
+# Build output
+Debug/
+Release/
+
+# Object files
+*.o
+*.d
+*.cyclo
+*.su
+*.list
+*.map
+*.elf
+*.bin
+*.hex
+*.lss
+*.sym
+
+# Build system generated
+objects.list
+objects.mk
+sources.mk
+makefile
+
+# IDE settings (Eclipse/STM32CubeIDE)
+.settings/
+
+# macOS
+.DS_Store
+._*
+
+# Backup files
+*~
+*.bak
+*.swp
+*.swo
