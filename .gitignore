@@ -33,3 +33,6 @@ makefile
 *.bak
 *.swp
 *.swo
+
+.idea
+.vscode
