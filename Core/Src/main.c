@@ -173,8 +173,6 @@ int main(void) {
 	HAL_UART_Transmit(&huart1, (uint8_t*)"i-BUS Init OK (PA3, 115200 8E1)\r\n", 33, 10);
 
 	// 主循环局部变量
-	uint32_t adc_value;
-	uint32_t voltage_mv;
 	char uart_buffer[200];
 
 	// 初始化稳定检测变量
@@ -201,11 +199,6 @@ int main(void) {
 		int32_t bat_frac = (int32_t)((bat_voltage - bat_int) * 100);
 		if (bat_frac < 0) bat_frac = -bat_frac;
 
-		// 读取电位器（PA0/CH0）作为无RC时的备用油门
-		adc_value = ADC_ReadChannel(ADC_CHANNEL_0);
-		voltage_mv = adc_value * 3300 / 4095;
-		uint16_t pot_throttle = 1000 + (adc_value * 1000 / 4095);
-
 		// ====== RC遥控器输入处理 ======
 		g_rc_connected = IBUS_IsConnected();
 		if (g_rc_connected) {
@@ -230,11 +223,11 @@ int main(void) {
 				g_base_throttle = 1000;
 			}
 		} else {
-			// RC未连接：电位器模式，自稳，始终解锁
+			// RC未连接：目标角度归零，不解锁
 			g_rc_roll_target  = 0.0f;
 			g_rc_pitch_target = 0.0f;
-			g_rc_armed = 1;
-			g_base_throttle = pot_throttle;
+			g_rc_armed = 0;
+			g_base_throttle = 1000;
 		}
 
 		// ====== 低电压自动降落与禁止起飞逻辑 ======
@@ -257,8 +250,7 @@ int main(void) {
 			uint32_t elapsed_landing_time = current_tick - g_landing_start_time;
 			float progress = (float)elapsed_landing_time / LANDING_DURATION_MS;
 			if (progress > 1.0f) progress = 1.0f;
-			uint16_t landing_throttle = g_rc_connected ?
-				IBUS_GetChannel(IBUS_CH_THROTTLE) : pot_throttle;
+			uint16_t landing_throttle = IBUS_GetChannel(IBUS_CH_THROTTLE);
 			g_base_throttle = (uint16_t)(landing_throttle * (1.0f - progress) + 1000.0f * progress);
 			if (elapsed_landing_time >= LANDING_DURATION_MS) {
 				g_auto_landing_in_progress = 0;
@@ -323,7 +315,7 @@ int main(void) {
 			uint16_t m1 = g_motor1, m2 = g_motor2, m3 = g_motor3, m4 = g_motor4;
 
 			// RC状态指示
-			const char *rc_status = g_rc_connected ? (g_rc_armed ? "ARM" : "DIS") : "POT";
+			const char *rc_status = g_rc_connected ? (g_rc_armed ? "ARM" : "DIS") : "NORC";
 			sprintf(uart_buffer, "BAT:%ld.%02ldV %s P:%ld.%02lu R:%ld.%02lu T:%d M:%4d %4d %4d %4d\r\n",
 			        bat_int, bat_frac, rc_status,
 			        (int32_t)local_angle.pitch, (uint32_t)((local_angle.pitch >= 0 ? local_angle.pitch : -local_angle.pitch) * 100) % 100,
