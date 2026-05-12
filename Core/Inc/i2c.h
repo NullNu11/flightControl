@@ -97,10 +97,10 @@ HAL_StatusTypeDef MPU6050_ReadAccel(int16_t *accel_x, int16_t *accel_y, int16_t 
 HAL_StatusTypeDef MPU6050_ReadGyro(int16_t *gyro_x, int16_t *gyro_y, int16_t *gyro_z);
 HAL_StatusTypeDef MPU6050_CheckConnection(void);
 
-// 角度计算函数
+// 角度计算函数（dt参数：采样间隔秒数，传0则自动测量）
 void MPU6050_ComputeAngles(int16_t accel_x, int16_t accel_y, int16_t accel_z,
                            int16_t gyro_x, int16_t gyro_y, int16_t gyro_z,
-                           Angle_t *angle);
+                           Angle_t *angle, float dt);
 
 // 卡尔曼滤波器函数（新版本）
 void Kalman_Init(Kalman_t *kalman);

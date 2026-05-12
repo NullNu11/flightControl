@@ -453,15 +453,18 @@ void MPU6050_ComputeAngles(int16_t accel_x, int16_t accel_y, int16_t accel_z,
 // ============================================================================
 
 // 计算俯仰角和翻滚角（使用卡尔曼滤波器）
+// dt: 采样间隔（秒），传0则自动通过HAL_GetTick测量
 void MPU6050_ComputeAngles(int16_t accel_x, int16_t accel_y, int16_t accel_z,
                            int16_t gyro_x, int16_t gyro_y, int16_t gyro_z,
-                           Angle_t *angle)
+                           Angle_t *angle, float dt)
 {
-    // 测量实际采样间隔
-    static uint32_t last_time = 0;
-    uint32_t now = HAL_GetTick();
-    float dt = (last_time == 0) ? 0.05f : (float)(now - last_time) / 1000.0f;
-    last_time = now;
+    // 如果dt为0，自动测量采样间隔
+    if (dt <= 0.0f) {
+        static uint32_t last_time = 0;
+        uint32_t now = HAL_GetTick();
+        dt = (last_time == 0) ? 0.05f : (float)(now - last_time) / 1000.0f;
+        last_time = now;
+    }
     if (dt < 0.001f) dt = 0.001f;
     if (dt > 0.5f)   dt = 0.5f;
 

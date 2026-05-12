@@ -22,6 +22,9 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "main.h"
+#include "tim.h"
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,7 +60,9 @@
 /* External variables --------------------------------------------------------*/
 
 /* USER CODE BEGIN EV */
-
+extern TIM_HandleTypeDef htim3;
+extern UART_HandleTypeDef huart2;
+extern DMA_HandleTypeDef hdma_usart2_rx;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -199,5 +204,41 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief  TIM3中断处理函数（飞控400Hz定时器）
+  */
+void TIM3_IRQHandler(void)
+{
+    HAL_TIM_IRQHandler(&htim3);
+}
+
+/**
+  * @brief  USART2中断处理函数（i-BUS IDLE帧边界检测）
+  */
+void USART2_IRQHandler(void)
+{
+    IBUS_ProcessIdle();
+    HAL_UART_IRQHandler(&huart2);
+}
+
+/**
+  * @brief  DMA1 Stream5中断处理函数（USART2_RX DMA传输完成）
+  */
+void DMA1_Stream5_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&hdma_usart2_rx);
+}
+
+/**
+  * @brief  定时器周期溢出回调
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM3)
+    {
+        FlightControl_Update();
+    }
+}
 
 /* USER CODE END 1 */

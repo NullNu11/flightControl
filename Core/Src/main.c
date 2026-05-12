@@ -25,6 +25,7 @@
 #include "usart.h"
 #include "gpio.h"
 #include "ssd1306.h"
+#include "ibus.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -40,12 +41,32 @@ void SystemClock_Config(void);
 // 低电压保护参数
 #define LOW_BATTERY_THRESHOLD   10.2f   // 3S电池: 3.4V/cell，留有降落裕量
 #define LANDING_DURATION_MS     8000u   // 8秒平稳降落
+#define FLIGHT_CONTROL_DT      0.0025f // 飞控采样周期: 1/400Hz = 2.5ms
 
-// 自动降落与低电压相关变量（放在USER CODE BEGIN 0区域，避免CubeMX覆盖）
-static uint8_t has_landed = 0;
-static uint8_t low_battery_triggered = 0;
-static uint8_t auto_landing_in_progress = 0;
-static uint32_t landing_start_time = 0;
+// ====== 飞控共享变量（ISR与主循环之间共享，必须volatile） ======
+volatile uint8_t  g_mpu_ok = 0;               // MPU6050初始化成功标志
+volatile Angle_t  g_angle = {0, 0};           // 最新角度（ISR写，主循环读）
+volatile int16_t  g_pitch_adjust = 0;         // 俯仰调节量
+volatile int16_t  g_roll_adjust = 0;          // 翻滚调节量
+volatile uint16_t g_motor1 = 1000;            // 电机1脉宽
+volatile uint16_t g_motor2 = 1000;            // 电机2脉宽
+volatile uint16_t g_motor3 = 1000;            // 电机3脉宽
+volatile uint16_t g_motor4 = 1000;            // 电机4脉宽
+volatile uint8_t  g_mpu_read_ok = 0;          // 最新一次MPU读取是否成功
+
+// 主循环写，ISR读
+volatile uint16_t g_base_throttle = 1000;     // 基础油门（电位器/降落逻辑控制）
+volatile uint8_t  g_init_phase = 1;           // 初始化阶段标志
+volatile uint8_t  g_has_landed = 0;           // 已降落标志
+volatile uint8_t  g_auto_landing_in_progress = 0; // 自动降落中
+volatile uint32_t g_landing_start_time = 0;   // 降落开始时间
+volatile uint8_t  g_low_battery_triggered = 0;// 低电压触发标志
+
+// RC遥控器共享变量（主循环写，ISR读）
+volatile float    g_rc_pitch_target = 0.0f;   // 目标俯仰角（度）
+volatile float    g_rc_roll_target = 0.0f;    // 目标翻滚角（度）
+volatile uint8_t  g_rc_connected = 0;          // RC连接状态
+volatile uint8_t  g_rc_armed = 0;              // RC解锁状态
 
 /* USER CODE END 0 */
 
@@ -115,8 +136,6 @@ int main(void) {
 	HAL_Delay(500);
 
 	// MPU6050初始化
-	uint8_t mpu_ok = 0;  // MPU6050初始化成功标志
-	HAL_UART_Transmit(&huart1, (uint8_t*)"MPU6050 Initializing...\r\n", 24, 10);
 	if (MPU6050_CheckConnection() != HAL_OK)
 	{
 		HAL_UART_Transmit(&huart1, (uint8_t*)"MPU6050 NOT FOUND!\r\n", 20, 10);
@@ -126,7 +145,7 @@ int main(void) {
 		HAL_UART_Transmit(&huart1, (uint8_t*)"MPU6050 Detected!\r\n", 18, 10);
 		if (MPU6050_Init() == HAL_OK)
 		{
-			mpu_ok = 1;
+			g_mpu_ok = 1;
 			HAL_UART_Transmit(&huart1, (uint8_t*)"MPU6050 OK!\r\n", 13, 10);
 
 			// 校准MPU6050（需要无人机水平放置并保持静止）
@@ -136,7 +155,6 @@ int main(void) {
 			HAL_Delay(500);
 
 			// 重置角度为0（使用加速度计）
-			// 注：当前使用卡尔曼滤波器，旧的互补滤波器代码已注释
 			MPU6050_ResetAngles();
 			HAL_UART_Transmit(&huart1, (uint8_t*)"Ready!\r\n", 9, 10);
 		}
@@ -146,29 +164,27 @@ int main(void) {
 		}
 	}
 
-	// ADC变量
-	uint32_t adc_value;
-	uint32_t voltage_mv;  // 电压(毫伏)
-	int16_t accel_x, accel_y, accel_z;  // 加速度计
-	int16_t gyro_x, gyro_y, gyro_z;      // 陀螺仪
-	Angle_t angle;  // 角度
+	// 启动飞控定时器中断（TIM3 @ 400Hz）
+	FlightControl_Start();
+	HAL_UART_Transmit(&huart1, (uint8_t*)"Flight Control ISR Started @ 400Hz\r\n", 36, 10);
 
-	// 电机控制变量
-	uint16_t motor1, motor2, motor3, motor4;
-	uint16_t base_throttle = 1200;  // 基础油门
-	int16_t pitch_adjust = 0;
-	int16_t roll_adjust = 0;
+	// 初始化i-BUS接收（USART2 DMA + IDLE中断）
+	IBUS_Init();
+	HAL_UART_Transmit(&huart1, (uint8_t*)"i-BUS Init OK (PA3, 115200 8E1)\r\n", 33, 10);
+
+	// 主循环局部变量
+	uint32_t adc_value;
+	uint32_t voltage_mv;
 	char uart_buffer[200];
 
 	// 初始化稳定检测变量
-	uint8_t init_phase = 1;  // 初始化阶段标志：1=初始化中，0=初始化完成
-	uint16_t stable_count = 0;  // 稳定计数器
-	uint16_t required_stable_samples = 30;  // 需要连续30次采样稳定(约1.5秒)
-	uint32_t init_start_time = 0;  // 初始化开始时间
-	float angle_tolerance = 1.0f;  // 角度容差范围（度）
-	// OLED刷新控制（降低频率避免拖慢主循环）
+	uint16_t stable_count = 0;
+	uint16_t required_stable_samples = 30;
+	uint32_t init_start_time = 0;
+	float angle_tolerance = 1.0f;
+	// OLED刷新控制
 	uint32_t oled_last_update = 0;
-	uint32_t oled_update_interval = 200;  // 每200ms刷新一次OLED
+	uint32_t oled_update_interval = 200;
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -185,179 +201,163 @@ int main(void) {
 		int32_t bat_frac = (int32_t)((bat_voltage - bat_int) * 100);
 		if (bat_frac < 0) bat_frac = -bat_frac;
 
-		// 使用ADC_ReadChannel读取电位器（PA0/CH0），避免与电池通道冲突
+		// 读取电位器（PA0/CH0）作为无RC时的备用油门
 		adc_value = ADC_ReadChannel(ADC_CHANNEL_0);
-		// 转换为电压(毫伏): 0-3300mV
 		voltage_mv = adc_value * 3300 / 4095;
-
-		// 使用电位器控制基础油门 (1000-2000us全范围)
 		uint16_t pot_throttle = 1000 + (adc_value * 1000 / 4095);
 
+		// ====== RC遥控器输入处理 ======
+		g_rc_connected = IBUS_IsConnected();
+		if (g_rc_connected) {
+			uint16_t ch_roll     = IBUS_GetChannel(IBUS_CH_ROLL);
+			uint16_t ch_pitch    = IBUS_GetChannel(IBUS_CH_PITCH);
+			uint16_t ch_throttle = IBUS_GetChannel(IBUS_CH_THROTTLE);
+			uint16_t ch_arm      = IBUS_GetChannel(IBUS_CH_ARM);
+
+			// 摇杆映射到目标角度: 中心=0°, 满偏=±30°
+			g_rc_roll_target  = ((float)ch_roll  - IBUS_CH_CENTER) /
+			                    (IBUS_CH_MAX - IBUS_CH_CENTER) * RC_MAX_ANGLE;
+			g_rc_pitch_target = ((float)ch_pitch - IBUS_CH_CENTER) /
+			                    (IBUS_CH_MAX - IBUS_CH_CENTER) * RC_MAX_ANGLE;
+
+			// 解锁开关: CH5 > 1500 = 解锁
+			g_rc_armed = (ch_arm > 1500) ? 1 : 0;
+
+			// 油门（仅解锁时生效）
+			if (g_rc_armed) {
+				g_base_throttle = ch_throttle;
+			} else {
+				g_base_throttle = 1000;
+			}
+		} else {
+			// RC未连接：电位器模式，自稳，始终解锁
+			g_rc_roll_target  = 0.0f;
+			g_rc_pitch_target = 0.0f;
+			g_rc_armed = 1;
+			g_base_throttle = pot_throttle;
+		}
+
 		// ====== 低电压自动降落与禁止起飞逻辑 ======
-		if (has_landed) {
-			base_throttle = 1000;
-			pitch_adjust = 0;
-			roll_adjust = 0;
-			Motor_SetAll(1000, 1000, 1000, 1000);
-			init_phase = 0;
+		if (g_has_landed) {
+			g_base_throttle = 1000;
 			sprintf(uart_buffer, "LANDED - NO RE-ARM. Bat: %ld.%02ldV\r\n", bat_int, bat_frac);
 			HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
 			HAL_Delay(100);
 			continue;
 		}
 
-		if (bat_voltage < LOW_BATTERY_THRESHOLD && !low_battery_triggered && !init_phase) {
-			low_battery_triggered = 1;
-			auto_landing_in_progress = 1;
-			landing_start_time = current_tick;
+		if (bat_voltage < LOW_BATTERY_THRESHOLD && !g_low_battery_triggered && !g_init_phase) {
+			g_low_battery_triggered = 1;
+			g_auto_landing_in_progress = 1;
+			g_landing_start_time = current_tick;
 			HAL_UART_Transmit(&huart1, (uint8_t*)"\r\nLOW BATTERY! Initiating Auto-Landing...\r\n", 44, 10);
 		}
 
-		if (auto_landing_in_progress) {
-			uint32_t elapsed_landing_time = current_tick - landing_start_time;
-			// 线性递减：从当前油门逐步降到1000
+		if (g_auto_landing_in_progress) {
+			uint32_t elapsed_landing_time = current_tick - g_landing_start_time;
 			float progress = (float)elapsed_landing_time / LANDING_DURATION_MS;
 			if (progress > 1.0f) progress = 1.0f;
-			base_throttle = (uint16_t)(pot_throttle * (1.0f - progress) + 1000.0f * progress);
+			uint16_t landing_throttle = g_rc_connected ?
+				IBUS_GetChannel(IBUS_CH_THROTTLE) : pot_throttle;
+			g_base_throttle = (uint16_t)(landing_throttle * (1.0f - progress) + 1000.0f * progress);
 			if (elapsed_landing_time >= LANDING_DURATION_MS) {
-				auto_landing_in_progress = 0;
-				has_landed = 1;
+				g_auto_landing_in_progress = 0;
+				g_has_landed = 1;
 				HAL_UART_Transmit(&huart1, (uint8_t*)"\r\nAuto-Landing Complete. System Disarmed.\r\n", 44, 10);
 			}
-		} else {
-			base_throttle = pot_throttle;
 		}
 
-		// 读取MPU6050数据（仅在初始化成功时读取）
-		if (mpu_ok &&
-		    MPU6050_ReadAccel(&accel_x, &accel_y, &accel_z) == HAL_OK &&
-		    MPU6050_ReadGyro(&gyro_x, &gyro_y, &gyro_z) == HAL_OK)
+		// ====== 初始化阶段：等待角度稳定 ======
+		if (g_init_phase)
 		{
-			// 计算俯仰角和翻滚角（卡尔曼滤波）
-			MPU6050_ComputeAngles(accel_x, accel_y, accel_z,
-			                       gyro_x, gyro_y, gyro_z, &angle);
+			Angle_t local_angle = g_angle;
 
-			// 初始化阶段：等待角度稳定
-			if (init_phase)
+			if (init_start_time == 0)
 			{
-				if (init_start_time == 0)
-				{
-					init_start_time = current_tick;
-				}
+				init_start_time = current_tick;
+			}
 
-				uint32_t elapsed_time = current_tick - init_start_time;
-				if (elapsed_time > 30000 && angle_tolerance == 1.0f)
-				{
-					angle_tolerance = 2.0f;
-					HAL_UART_Transmit(&huart1, (uint8_t*)"\r\nTIMEOUT - Relaxing tolerance to +/- 2 degrees\r\n", 49, 10);
-					stable_count = 0;
-				}
-				if (elapsed_time > 60000 && angle_tolerance == 2.0f)
-				{
-					angle_tolerance = 3.0f;
-					HAL_UART_Transmit(&huart1, (uint8_t*)"\r\nTIMEOUT - Relaxing tolerance to +/- 3 degrees\r\n", 49, 10);
-					stable_count = 0;
-				}
+			uint32_t elapsed_time = current_tick - init_start_time;
+			if (elapsed_time > 30000 && angle_tolerance == 1.0f)
+			{
+				angle_tolerance = 2.0f;
+				HAL_UART_Transmit(&huart1, (uint8_t*)"\r\nTIMEOUT - Relaxing tolerance to +/- 2 degrees\r\n", 49, 10);
+				stable_count = 0;
+			}
+			if (elapsed_time > 60000 && angle_tolerance == 2.0f)
+			{
+				angle_tolerance = 3.0f;
+				HAL_UART_Transmit(&huart1, (uint8_t*)"\r\nTIMEOUT - Relaxing tolerance to +/- 3 degrees\r\n", 49, 10);
+				stable_count = 0;
+			}
 
-				if (angle.pitch >= -angle_tolerance && angle.pitch <= angle_tolerance &&
-				    angle.roll >= -angle_tolerance && angle.roll <= angle_tolerance)
+			if (local_angle.pitch >= -angle_tolerance && local_angle.pitch <= angle_tolerance &&
+			    local_angle.roll >= -angle_tolerance && local_angle.roll <= angle_tolerance)
+			{
+				stable_count++;
+				if (stable_count >= required_stable_samples)
 				{
-					stable_count++;
-					if (stable_count >= required_stable_samples)
-					{
-						init_phase = 0;
-						HAL_UART_Transmit(&huart1, (uint8_t*)"\r\n=== INITIALIZATION COMPLETE ===\r\n", 34, 10);
-						HAL_UART_Transmit(&huart1, (uint8_t*)"Ready for flight control!\r\n", 27, 10);
-					}
+					g_init_phase = 0;
+					HAL_UART_Transmit(&huart1, (uint8_t*)"\r\n=== INITIALIZATION COMPLETE ===\r\n", 34, 10);
+					HAL_UART_Transmit(&huart1, (uint8_t*)"Ready for flight control!\r\n", 27, 10);
 				}
-				else
-				{
-					stable_count = 0;
-				}
-
-				// 初始化阶段只打印角度，不控制电机
-				{
-					int32_t tol_i = (int32_t)angle_tolerance;
-					int32_t tol_f = (int32_t)((angle_tolerance - tol_i) * 10);
-					if (tol_f < 0) tol_f = -tol_f;
-					sprintf(uart_buffer, "INIT PHASE - P: %ld.%02lu R: %ld.%02lu | Stable: %3d/%3d | Tol: %ld.%ld deg | Time: %lu s\r\n",
-							(int32_t)angle.pitch, (uint32_t)((angle.pitch >= 0 ? angle.pitch : -angle.pitch) * 100) % 100,
-							(int32_t)angle.roll, (uint32_t)((angle.roll >= 0 ? angle.roll : -angle.roll) * 100) % 100,
-							stable_count, required_stable_samples, tol_i, tol_f, elapsed_time / 1000);
-				}
-				HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
 			}
 			else
 			{
-				// 初始化完成，开始飞行控制
-				if (fabsf(angle.pitch) < ANGLE_DEADZONE) angle.pitch = 0.0f;
-				if (fabsf(angle.roll) < ANGLE_DEADZONE) angle.roll = 0.0f;
-
-				pitch_adjust = (int16_t)(angle.pitch * 2.0f);
-				roll_adjust = (int16_t)(angle.roll * 2.0f);
-				if (pitch_adjust > 500) pitch_adjust = 500;
-				if (pitch_adjust < -500) pitch_adjust = -500;
-				if (roll_adjust > 500) roll_adjust = 500;
-				if (roll_adjust < -500) roll_adjust = -500;
-
-				motor1 = base_throttle + pitch_adjust - roll_adjust;
-				motor2 = base_throttle + pitch_adjust + roll_adjust;
-				motor3 = base_throttle - pitch_adjust - roll_adjust;
-				motor4 = base_throttle - pitch_adjust + roll_adjust;
-
-				if (motor1 < 1000) motor1 = 1000;
-				if (motor1 > 2000) motor1 = 2000;
-				if (motor2 < 1000) motor2 = 1000;
-				if (motor2 > 2000) motor2 = 2000;
-				if (motor3 < 1000) motor3 = 1000;
-				if (motor3 > 2000) motor3 = 2000;
-				if (motor4 < 1000) motor4 = 1000;
-				if (motor4 > 2000) motor4 = 2000;
-
-				Motor_SetAll(motor1, motor2, motor3, motor4);
-
-				sprintf(uart_buffer, "BAT:%ld.%02ldV POT:%lu.%02luV P:%ld.%02lu R:%ld.%02lu M:%4d %4d %4d %4d\r\n",
-				        bat_int, bat_frac,
-				        voltage_mv / 1000, (voltage_mv % 1000) / 100,
-				        (int32_t)angle.pitch, (uint32_t)((angle.pitch >= 0 ? angle.pitch : -angle.pitch) * 100) % 100,
-				        (int32_t)angle.roll, (uint32_t)((angle.roll >= 0 ? angle.roll : -angle.roll) * 100) % 100,
-				        motor1, motor2, motor3, motor4);
-				HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
-
-				// OLED显示（每200ms刷新一次，避免拖慢主循环）
-				uint32_t now = HAL_GetTick();
-				if (now - oled_last_update >= oled_update_interval)
-				{
-					oled_last_update = now;
-					SSD1306_Clear();
-					SSD1306_GotoXY(0, 0);
-					SSD1306_Printf("BAT:%d.%02dV", (int)bat_int, (int)bat_frac);
-					SSD1306_GotoXY(0, 1);
-					{
-						int32_t sp = (int32_t)angle.pitch;
-						int32_t sp_f = (int32_t)((angle.pitch >= 0 ? angle.pitch : -angle.pitch) * 100) % 100;
-						int32_t sr = (int32_t)angle.roll;
-						int32_t sr_f = (int32_t)((angle.roll >= 0 ? angle.roll : -angle.roll) * 100) % 100;
-						char p_sign = (angle.pitch >= 0) ? '+' : '-';
-						char r_sign = (angle.roll >= 0) ? '+' : '-';
-						SSD1306_Printf("P:%c%d.%02d R:%c%d.%02d",
-								p_sign, (int)sp, (int)sp_f,
-								r_sign, (int)sr, (int)sr_f);
-					}
-					SSD1306_GotoXY(0, 2);
-					SSD1306_Printf("M1:%d M2:%d", (int)motor1, (int)motor2);
-					SSD1306_GotoXY(0, 3);
-					SSD1306_Printf("M3:%d M4:%d", (int)motor3, (int)motor4);
-					SSD1306_UpdateScreen();
-				}
+				stable_count = 0;
 			}
-		}
-		else if (mpu_ok)
-		{
-			// MPU6050曾初始化成功但读取失败
-			sprintf(uart_buffer, "ADC: %4lu, V: %lu.%02luV | MPU6050 Read Error\r\n",
-					adc_value, voltage_mv / 1000, (voltage_mv % 1000) / 10);
+
+			int32_t tol_i = (int32_t)angle_tolerance;
+			int32_t tol_f = (int32_t)((angle_tolerance - tol_i) * 10);
+			if (tol_f < 0) tol_f = -tol_f;
+			sprintf(uart_buffer, "INIT PHASE - P: %ld.%02lu R: %ld.%02lu | Stable: %3d/%3d | Tol: %ld.%ld deg | Time: %lu s\r\n",
+					(int32_t)local_angle.pitch, (uint32_t)((local_angle.pitch >= 0 ? local_angle.pitch : -local_angle.pitch) * 100) % 100,
+					(int32_t)local_angle.roll, (uint32_t)((local_angle.roll >= 0 ? local_angle.roll : -local_angle.roll) * 100) % 100,
+					stable_count, required_stable_samples, tol_i, tol_f, elapsed_time / 1000);
 			HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
+		}
+		else
+		{
+			// 飞行控制已在ISR中完成，主循环仅做数据输出
+			Angle_t local_angle = g_angle;
+			uint16_t m1 = g_motor1, m2 = g_motor2, m3 = g_motor3, m4 = g_motor4;
+
+			// RC状态指示
+			const char *rc_status = g_rc_connected ? (g_rc_armed ? "ARM" : "DIS") : "POT";
+			sprintf(uart_buffer, "BAT:%ld.%02ldV %s P:%ld.%02lu R:%ld.%02lu T:%d M:%4d %4d %4d %4d\r\n",
+			        bat_int, bat_frac, rc_status,
+			        (int32_t)local_angle.pitch, (uint32_t)((local_angle.pitch >= 0 ? local_angle.pitch : -local_angle.pitch) * 100) % 100,
+			        (int32_t)local_angle.roll, (uint32_t)((local_angle.roll >= 0 ? local_angle.roll : -local_angle.roll) * 100) % 100,
+			        g_base_throttle,
+			        m1, m2, m3, m4);
+			HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
+
+			// OLED显示（每200ms刷新一次）
+			uint32_t now = HAL_GetTick();
+			if (now - oled_last_update >= oled_update_interval)
+			{
+				oled_last_update = now;
+				SSD1306_Clear();
+				SSD1306_GotoXY(0, 0);
+				SSD1306_Printf("BAT:%d.%02dV %s", (int)bat_int, (int)bat_frac, rc_status);
+				SSD1306_GotoXY(0, 1);
+				{
+					int32_t sp = (int32_t)local_angle.pitch;
+					int32_t sp_f = (int32_t)((local_angle.pitch >= 0 ? local_angle.pitch : -local_angle.pitch) * 100) % 100;
+					int32_t sr = (int32_t)local_angle.roll;
+					int32_t sr_f = (int32_t)((local_angle.roll >= 0 ? local_angle.roll : -local_angle.roll) * 100) % 100;
+					char p_sign = (local_angle.pitch >= 0) ? '+' : '-';
+					char r_sign = (local_angle.roll >= 0) ? '+' : '-';
+					SSD1306_Printf("P:%c%d.%02d R:%c%d.%02d",
+							p_sign, (int)sp, (int)sp_f,
+							r_sign, (int)sr, (int)sr_f);
+				}
+				SSD1306_GotoXY(0, 2);
+				SSD1306_Printf("M1:%d M2:%d", (int)m1, (int)m2);
+				SSD1306_GotoXY(0, 3);
+				SSD1306_Printf("M3:%d M4:%d", (int)m3, (int)m4);
+				SSD1306_UpdateScreen();
+			}
 		}
 
 		HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);
@@ -408,6 +408,118 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+ * @brief 启动飞控定时器中断（TIM3 @ 400Hz）
+ */
+void FlightControl_Start(void)
+{
+    // 使能TIM3 NVIC中断
+    HAL_NVIC_SetPriority(TIM3_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(TIM3_IRQn);
+    // 使能TIM3更新中断
+    __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
+}
+
+/**
+ * @brief 飞控定时器中断回调（400Hz）
+ *        读取MPU6050、计算角度、控制电机输出
+ *        由 HAL_TIM_PeriodElapsedCallback 调用
+ */
+void FlightControl_Update(void)
+{
+    if (!g_mpu_ok) return;
+
+    // 读取MPU6050
+    int16_t accel_x, accel_y, accel_z;
+    int16_t gyro_x, gyro_y, gyro_z;
+
+    if (MPU6050_ReadAccel(&accel_x, &accel_y, &accel_z) != HAL_OK ||
+        MPU6050_ReadGyro(&gyro_x, &gyro_y, &gyro_z) != HAL_OK)
+    {
+        g_mpu_read_ok = 0;
+        return;
+    }
+    g_mpu_read_ok = 1;
+
+    // 计算角度（使用固定dt=2.5ms，因为定时器频率为400Hz）
+    Angle_t local_angle;
+    MPU6050_ComputeAngles(accel_x, accel_y, accel_z,
+                           gyro_x, gyro_y, gyro_z,
+                           &local_angle, FLIGHT_CONTROL_DT);
+    g_angle = local_angle;
+
+    // 初始化阶段：只读角度，不控制电机
+    if (g_init_phase) return;
+
+    // 已降落：关闭电机
+    if (g_has_landed) {
+        Motor_SetAll(1000, 1000, 1000, 1000);
+        g_motor1 = g_motor2 = g_motor3 = g_motor4 = 1000;
+        return;
+    }
+
+    // 未解锁：电机最低油门
+    if (!g_rc_armed) {
+        Motor_SetAll(1000, 1000, 1000, 1000);
+        g_motor1 = g_motor2 = g_motor3 = g_motor4 = 1000;
+        return;
+    }
+
+    // 应用角度死区
+    if (fabsf(local_angle.pitch) < ANGLE_DEADZONE) local_angle.pitch = 0.0f;
+    if (fabsf(local_angle.roll) < ANGLE_DEADZONE) local_angle.roll = 0.0f;
+
+    // 角度模式PID：误差 = 目标角度 - 实际角度
+    float pitch_error = g_rc_pitch_target - local_angle.pitch;
+    float roll_error  = g_rc_roll_target  - local_angle.roll;
+
+    // 比例控制
+    int16_t pitch_adj = (int16_t)(pitch_error * 2.0f);
+    int16_t roll_adj  = (int16_t)(roll_error * 2.0f);
+    if (pitch_adj > 500)  pitch_adj = 500;
+    if (pitch_adj < -500) pitch_adj = -500;
+    if (roll_adj > 500)   roll_adj = 500;
+    if (roll_adj < -500)  roll_adj = -500;
+
+    g_pitch_adjust = pitch_adj;
+    g_roll_adjust = roll_adj;
+
+    // 读取基础油门
+    uint16_t base = g_base_throttle;
+
+    // 混控输出
+    uint16_t m1 = base + pitch_adj - roll_adj;
+    uint16_t m2 = base + pitch_adj + roll_adj;
+    uint16_t m3 = base - pitch_adj - roll_adj;
+    uint16_t m4 = base - pitch_adj + roll_adj;
+
+    // 限幅
+    if (m1 < 1000) m1 = 1000; if (m1 > 2000) m1 = 2000;
+    if (m2 < 1000) m2 = 1000; if (m2 > 2000) m2 = 2000;
+    if (m3 < 1000) m3 = 1000; if (m3 > 2000) m3 = 2000;
+    if (m4 < 1000) m4 = 1000; if (m4 > 2000) m4 = 2000;
+
+    // 设置电机PWM
+    Motor_SetAll(m1, m2, m3, m4);
+
+    // 保存到共享变量
+    g_motor1 = m1;
+    g_motor2 = m2;
+    g_motor3 = m3;
+    g_motor4 = m4;
+}
+
+/**
+ * @brief UART接收完成回调（DMA传输完成时调用）
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2)
+    {
+        IBUS_RxCpltCallback();
+    }
+}
 
 /* USER CODE END 4 */
 

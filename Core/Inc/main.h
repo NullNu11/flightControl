@@ -53,7 +53,8 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+void FlightControl_Update(void);   // 定时器中断回调：飞控计算
+void FlightControl_Start(void);    // 启动飞控定时器中断
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
