@@ -22,6 +22,12 @@ static volatile uint16_t ibus_channels[IBUS_CHANNELS];
 static volatile uint8_t  ibus_frame_valid = 0;
 static volatile uint32_t ibus_last_frame_time = 0;
 
+/* 调试计数器 */
+static volatile uint32_t dbg_idle_count = 0;
+static volatile uint32_t dbg_dma_count  = 0;
+static volatile uint32_t dbg_checksum_fail = 0;
+static volatile uint32_t dbg_header_fail = 0;
+
 /**
  * @brief 初始化i-BUS接收
  *        配置DMA + IDLE中断，启动接收
@@ -87,10 +93,16 @@ static void IBUS_ParseFrame(void)
     const uint8_t *data = ibus_rx_buffer;
 
     /* 验证帧头 */
-    if (data[0] != 0x20 || data[1] != 0x40) return;
+    if (data[0] != 0x20 || data[1] != 0x40) {
+        dbg_header_fail++;
+        return;
+    }
 
     /* 验证校验和 */
-    if (!IBUS_ValidateChecksum(data)) return;
+    if (!IBUS_ValidateChecksum(data)) {
+        dbg_checksum_fail++;
+        return;
+    }
 
     /* 提取14个通道值（小端序，11-bit有效） */
     for (uint8_t i = 0; i < IBUS_CHANNELS; i++)
@@ -136,6 +148,7 @@ void IBUS_ProcessIdle(void)
     if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE))
     {
         __HAL_UART_CLEAR_IDLEFLAG(&huart2);
+        dbg_idle_count++;
 
         /* DMA仍在传输 = 起始位置不在帧头，重启对齐 */
         if (huart2.RxXferCount != 0)
@@ -152,7 +165,38 @@ void IBUS_ProcessIdle(void)
  */
 void IBUS_RxCpltCallback(void)
 {
+    dbg_dma_count++;
     IBUS_ParseFrame();
     /* 重启DMA接收下一帧 */
     HAL_UART_Receive_DMA(&huart2, ibus_rx_buffer, IBUS_FRAME_SIZE);
+}
+
+/**
+ * @brief 打印i-BUS调试信息（用于排查连接问题）
+ */
+void IBUS_DebugPrint(void)
+{
+    char buf[120];
+    extern UART_HandleTypeDef huart1;
+    sprintf(buf, "i-BUS DBG: IDLE=%lu DMA=%lu HDR_ERR=%lu CHK_ERR=%lu VALID=%u\r\n",
+            dbg_idle_count, dbg_dma_count, dbg_header_fail, dbg_checksum_fail, ibus_frame_valid);
+    HAL_UART_Transmit(&huart1, (uint8_t*)buf, strlen(buf), 50);
+
+    // 打印原始帧数据（前8字节）
+    if (dbg_dma_count > 0)
+    {
+        sprintf(buf, "RAW: %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+                ibus_rx_buffer[0], ibus_rx_buffer[1], ibus_rx_buffer[2], ibus_rx_buffer[3],
+                ibus_rx_buffer[4], ibus_rx_buffer[5], ibus_rx_buffer[6], ibus_rx_buffer[7]);
+        HAL_UART_Transmit(&huart1, (uint8_t*)buf, strlen(buf), 50);
+
+        // 如果有有效帧，打印通道值
+        if (ibus_frame_valid)
+        {
+            sprintf(buf, "CH: R=%d P=%d T=%d Y=%d A=%d\r\n",
+                    ibus_channels[0], ibus_channels[1], ibus_channels[2],
+                    ibus_channels[3], ibus_channels[4]);
+            HAL_UART_Transmit(&huart1, (uint8_t*)buf, strlen(buf), 50);
+        }
+    }
 }

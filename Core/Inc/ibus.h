@@ -40,6 +40,7 @@ uint16_t IBUS_GetChannel(uint8_t ch);
 uint8_t IBUS_IsConnected(void);
 void IBUS_ProcessIdle(void);
 void IBUS_RxCpltCallback(void);
+void IBUS_DebugPrint(void);
 
 #ifdef __cplusplus
 }

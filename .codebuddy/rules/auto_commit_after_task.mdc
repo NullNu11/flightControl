@@ -1,0 +1,24 @@
+---
+description: 
+alwaysApply: true
+enabled: true
+updatedAt: 2026-05-12T09:58:06.948Z
+provider: 
+---
+
+## 规则：每次完成代码修改任务后自动 git commit
+
+**触发条件**：每次完成用户请求的代码修改/新增/删除等操作后，且文件已成功保存。
+
+**执行动作**：
+1. 使用 `execute_command` 执行 `git status` 检查变更
+2. 使用 `execute_command` 执行 `git add -A` 暂存所有变更
+3. 使用 `execute_command` 执行 `git commit -m "描述本次改动内容"` 提交代码
+   - commit message 应简洁明了，概括本次具体做了什么（中文即可）
+   - 格式参考：`"删除电位器控制代码，飞控完全依赖RC接收机"`
+4. 如果没有变更（working tree clean），则跳过 commit
+
+**注意事项**：
+- 不要使用 `git push`，仅 commit 即可
+- 不要修改 git config
+- 不要使用 `--amend`

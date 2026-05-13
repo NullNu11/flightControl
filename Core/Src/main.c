@@ -183,6 +183,9 @@ int main(void) {
 	// OLED刷新控制
 	uint32_t oled_last_update = 0;
 	uint32_t oled_update_interval = 200;
+	// i-BUS调试打印控制
+	uint32_t ibus_dbg_last = 0;
+	uint32_t ibus_dbg_interval = 2000;  // 每2秒打印一次调试信息
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -198,6 +201,13 @@ int main(void) {
 		int32_t bat_int = (int32_t)bat_voltage;
 		int32_t bat_frac = (int32_t)((bat_voltage - bat_int) * 100);
 		if (bat_frac < 0) bat_frac = -bat_frac;
+
+		// i-BUS调试信息输出（每2秒）
+		if (current_tick - ibus_dbg_last >= ibus_dbg_interval)
+		{
+			ibus_dbg_last = current_tick;
+			IBUS_DebugPrint();
+		}
 
 		// ====== RC遥控器输入处理 ======
 		g_rc_connected = IBUS_IsConnected();
