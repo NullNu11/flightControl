@@ -25,6 +25,7 @@
 #include "main.h"
 #include "tim.h"
 #include "usart.h"
+#include "ibus.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -78,8 +79,8 @@ void NMI_Handler(void)
   /* USER CODE END NonMaskableInt_IRQn 0 */
   /* USER CODE BEGIN NonMaskableInt_IRQn 1 */
    while (1)
-  {
-  }
+   {
+   }
   /* USER CODE END NonMaskableInt_IRQn 1 */
 }
 
@@ -88,13 +89,13 @@ void NMI_Handler(void)
   */
 void HardFault_Handler(void)
 {
-  /* USER CODE BEGIN HardFault_IRQn 0 */
+  /* USER CODE BEGIN HardFaultFault_IRQn 0 */
 
-  /* USER CODE END HardFault_IRQn 0 */
+  /* USER CODE END HardFaultFault_IRQn 0 */
   while (1)
   {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    /* USER CODE END W1_HardFault_IRQn 0 */
+    /* USER CODE BEGIN W1_HardFaultFault_IRQn 0 */
+    /* USER CODE END W1_HardFaultFault_IRQn 0 */
   }
 }
 
@@ -103,13 +104,13 @@ void HardFault_Handler(void)
   */
 void MemManage_Handler(void)
 {
-  /* USER CODE BEGIN MemoryManagement_IRQn 0 */
+  /* USER CODE BEGIN MemoryManagementFault_IRQn 0 */
 
-  /* USER CODE END MemoryManagement_IRQn 0 */
+  /* USER CODE END MemoryManagementFault_IRQn 0 */
   while (1)
   {
-    /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
-    /* USER CODE END W1_MemoryManagement_IRQn 0 */
+    /* USER CODE BEGIN W1_MemoryManagementFault_IRQn 0 */
+    /* USER CODE END W1_MemoryManagementFault_IRQn 0 */
   }
 }
 
@@ -144,7 +145,7 @@ void UsageFault_Handler(void)
 }
 
 /**
-  * @brief This function handles System service call via SWI instruction.
+  * @brief This function handles System service call via SWI.
   */
 void SVC_Handler(void)
 {
@@ -161,12 +162,12 @@ void SVC_Handler(void)
   */
 void DebugMon_Handler(void)
 {
-  /* USER CODE BEGIN DebugMonitor_IRQn 0 */
+  /* USER CODE BEGIN Monitor_IRQn 0 */
 
-  /* USER CODE END DebugMonitor_IRQn 0 */
-  /* USER CODE BEGIN DebugMonitor_IRQn 1 */
+  /* USER CODE END Monitor_IRQn 0 */
+  /* USER CODE BEGIN Monitor_IRQn 1 */
 
-  /* USER CODE END DebugMonitor_IRQn 1 */
+  /* USER CODE END Monitor_IRQn 1 */
 }
 
 /**
@@ -199,7 +200,7 @@ void SysTick_Handler(void)
 /******************************************************************************/
 /* STM32F4xx Peripheral Interrupt Handlers                                    */
 /* Add here the Interrupt Handlers for the used peripherals.                  */
-/* For the available peripheral interrupt handler names,                      */
+/* For the available peripheral handler names,                                */
 /* please refer to the startup file (startup_stm32f4xx.s).                    */
 /******************************************************************************/
 
@@ -214,12 +215,25 @@ void TIM3_IRQHandler(void)
 }
 
 /**
-  * @brief  USART2中断处理函数（i-BUS IDLE帧边界检测）
+  * @brief  USART2中断处理函数（i-BUS接收）
+  *         处理 RXNE(逐字节) + IDLE(帧边界) 中断
   */
 void USART2_IRQHandler(void)
 {
-    IBUS_ProcessIdle();
-    HAL_UART_IRQHandler(&huart2);
+	/* 处理IDLE中断（帧间空闲检测）*/
+	IBUS_ProcessIdle();
+
+	/* 处理RXNE中断：逐字节读取i-BUS数据 */
+	if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE))
+	{
+		uint8_t byte = (uint8_t)(huart2.Instance->DR & 0xFF);
+		IBUS_OnRxByte(byte);
+	}
+
+	/* 清除可能的错误标志防止死锁*/
+	__HAL_UART_CLEAR_OREFLAG(&huart2);
+
+	HAL_UART_IRQHandler(&huart2);
 }
 
 /**

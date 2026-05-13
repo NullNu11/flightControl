@@ -209,6 +209,9 @@ int main(void) {
 			IBUS_DebugPrint();
 		}
 
+		// 从环形缓冲区解析i-BUS帧数据（中断接收 → 主循环解析）
+		IBUS_Update();
+
 		// ====== RC遥控器输入处理 ======
 		g_rc_connected = IBUS_IsConnected();
 		if (g_rc_connected) {
