@@ -10,11 +10,19 @@
 /* USER CODE END Header */
 #include "ibus.h"
 #include "usart.h"
+#include <string.h>
 
 /* DMA句柄: USART2_RX 使用 DMA1 Stream5 Channel4 */
 DMA_HandleTypeDef hdma_usart2_rx;
 
-/* 接收缓冲区 */
+/* 双缓冲区（交替使用） */
+#define IBUS_BUF_SIZE     64      // 稍大一些防止溢出
+static uint8_t ibus_buf_a[IBUS_BUF_SIZE];
+static uint8_t ibus_buf_b[IBUS_BUF_SIZE];
+static uint8_t *ibus_active_buf = ibus_buf_a;
+static volatile uint16_t ibus_received_len = 0;
+
+/* 帧解析缓冲区（从双缓冲区复制过来解析）*/
 static uint8_t ibus_rx_buffer[IBUS_FRAME_SIZE];
 
 /* 通道数据 */
@@ -37,7 +45,7 @@ void IBUS_Init(void)
     /* 使能DMA1时钟 */
     __HAL_RCC_DMA1_CLK_ENABLE();
 
-    /* 配置 DMA1 Stream5 Channel4 (USART2_RX) */
+    /* 配置 DMA1 Stream5 Channel4 (USART2_RX) - 循环模式 */
     hdma_usart2_rx.Instance = DMA1_Stream5;
     hdma_usart2_rx.Init.Channel           = DMA_CHANNEL_4;
     hdma_usart2_rx.Init.Direction         = DMA_PERIPH_TO_MEMORY;
@@ -45,7 +53,7 @@ void IBUS_Init(void)
     hdma_usart2_rx.Init.MemInc            = DMA_MINC_ENABLE;
     hdma_usart2_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
     hdma_usart2_rx.Init.MemDataAlignment  = DMA_MDATAALIGN_BYTE;
-    hdma_usart2_rx.Init.Mode              = DMA_NORMAL;
+    hdma_usart2_rx.Init.Mode              = DMA_CIRCULAR;      // 循环模式，不会停止
     hdma_usart2_rx.Init.Priority          = DMA_PRIORITY_MEDIUM;
     hdma_usart2_rx.Init.FIFOMode          = DMA_FIFOMODE_DISABLE;
     if (HAL_DMA_Init(&hdma_usart2_rx) != HAL_OK)
@@ -59,14 +67,15 @@ void IBUS_Init(void)
     /* 配置NVIC */
     HAL_NVIC_SetPriority(USART2_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
-    HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 5, 0);
-    HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
 
     /* 使能IDLE中断（帧边界检测） */
     __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);
 
-    /* 启动DMA接收 */
-    HAL_UART_Receive_DMA(&huart2, ibus_rx_buffer, IBUS_FRAME_SIZE);
+    /* 启动循环DMA接收（使用buf_a作为初始缓冲区）*/
+    ibus_active_buf = ibus_buf_a;
+    memset(ibus_buf_a, 0, IBUS_BUF_SIZE);
+    memset(ibus_buf_b, 0, IBUS_BUF_SIZE);
+    HAL_UART_Receive_DMA(&huart2, ibus_active_buf, IBUS_BUF_SIZE);
 }
 
 /**
@@ -139,9 +148,8 @@ uint8_t IBUS_IsConnected(void)
 }
 
 /**
- * @brief IDLE中断处理
- *        帧边界检测：IDLE时DMA未完成说明帧未对齐，重启DMA
- *        由 USART2_IRQHandler 调用
+ * @brief IDLE中断处理（循环DMA + 双缓冲帧对齐）
+ *        IDLE = 帧间空闲，此时切换缓冲区并解析已收到的数据
  */
 void IBUS_ProcessIdle(void)
 {
@@ -150,12 +158,39 @@ void IBUS_ProcessIdle(void)
         __HAL_UART_CLEAR_IDLEFLAG(&huart2);
         dbg_idle_count++;
 
-        /* DMA仍在传输 = 起始位置不在帧头，重启对齐 */
-        if (huart2.RxXferCount != 0)
+        /* 计算当前已接收的字节数（循环DMA总长度 - 剩余计数）*/
+        uint16_t received = (uint16_t)(IBUS_BUF_SIZE - __HAL_DMA_GET_COUNTER(hdma_usart2_rx.Instance));
+
+        if (received >= IBUS_FRAME_SIZE)
         {
+            /* 已收到完整帧，复制数据并解析 */
+            uint8_t *process_buf;
+            uint8_t *next_buf;
+
+            if (ibus_active_buf == ibus_buf_a) {
+                process_buf = ibus_buf_a;
+                next_buf    = ibus_buf_b;
+            } else {
+                process_buf = ibus_buf_b;
+                next_buf    = ibus_buf_a;
+            }
+
+            /* 复制原始数据到静态缓冲区供解析使用 */
+            memcpy(ibus_rx_buffer, process_buf, IBUS_FRAME_SIZE);
+
+            /* 切换到另一个缓冲区，清零后重启DMA */
+            memset(next_buf, 0, IBUS_BUF_SIZE);
+            ibus_active_buf = next_buf;
+
+            /* 停止并重新启动DMA（循环模式下需要这样切换缓冲区）*/
             HAL_UART_DMAStop(&huart2);
-            HAL_UART_Receive_DMA(&huart2, ibus_rx_buffer, IBUS_FRAME_SIZE);
+            HAL_UART_Receive_DMA(&huart2, ibus_active_buf, IBUS_BUF_SIZE);
+
+            /* 解析帧 */
+            dbg_dma_count++;
+            IBUS_ParseFrame();
         }
+        /* received < 32: 数据还不够，等待更多数据，不做任何操作 */
     }
 }
 
@@ -163,12 +198,14 @@ void IBUS_ProcessIdle(void)
  * @brief DMA接收完成回调
  *        由 HAL_UART_RxCpltCallback 调用
  */
+/**
+ * @brief DMA接收完成回调（循环DMA缓冲区满时触发）
+ *        正常情况下帧在IDLE中断中处理，此处作为安全兜底
+ */
 void IBUS_RxCpltCallback(void)
 {
+    /* 循环模式下DMA会自动继续，无需重启 */
     dbg_dma_count++;
-    IBUS_ParseFrame();
-    /* 重启DMA接收下一帧 */
-    HAL_UART_Receive_DMA(&huart2, ibus_rx_buffer, IBUS_FRAME_SIZE);
 }
 
 /**
