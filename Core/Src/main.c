@@ -185,7 +185,10 @@ int main(void) {
 	uint32_t oled_update_interval = 200;
 	// i-BUS调试打印控制
 	uint32_t ibus_dbg_last = 0;
-	uint32_t ibus_dbg_interval = 2000;  // 每2秒打印一次调试信息
+	uint32_t ibus_dbg_interval = 5000;   // 每5秒打印一次（减少阻塞）
+	// 串口状态行输出控制（降低频率以减少主循环延迟）
+	uint32_t status_last_print = 0;
+	uint32_t status_print_interval = 100; // 每100ms打印一次状态行
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -202,17 +205,8 @@ int main(void) {
 		int32_t bat_frac = (int32_t)((bat_voltage - bat_int) * 100);
 		if (bat_frac < 0) bat_frac = -bat_frac;
 
-		// i-BUS调试信息输出（每2秒）
-		if (current_tick - ibus_dbg_last >= ibus_dbg_interval)
-		{
-			ibus_dbg_last = current_tick;
-			IBUS_DebugPrint();
-		}
-
-		// 从环形缓冲区解析i-BUS帧数据（中断接收 → 主循环解析）
+		// i-BUS帧解析与RC输入处理（优先级最高，不受调试打印影响）
 		IBUS_Update();
-
-		// ====== RC遥控器输入处理 ======
 		g_rc_connected = IBUS_IsConnected();
 		if (g_rc_connected) {
 			uint16_t ch_roll     = IBUS_GetChannel(IBUS_CH_ROLL);
@@ -241,6 +235,13 @@ int main(void) {
 			g_rc_pitch_target = 0.0f;
 			g_rc_armed = 0;
 			g_base_throttle = 1000;
+		}
+
+		// i-BUS调试信息输出（每2秒）—— 放在RC处理之后，避免阻塞影响连接检测
+		if (current_tick - ibus_dbg_last >= ibus_dbg_interval)
+		{
+			ibus_dbg_last = current_tick;
+			IBUS_DebugPrint();
 		}
 
 		// ====== 低电压自动降落与禁止起飞逻辑 ======
@@ -315,11 +316,16 @@ int main(void) {
 			int32_t tol_i = (int32_t)angle_tolerance;
 			int32_t tol_f = (int32_t)((angle_tolerance - tol_i) * 10);
 			if (tol_f < 0) tol_f = -tol_f;
-			sprintf(uart_buffer, "INIT PHASE - P: %ld.%02lu R: %ld.%02lu | Stable: %3d/%3d | Tol: %ld.%ld deg | Time: %lu s\r\n",
-					(int32_t)local_angle.pitch, (uint32_t)((local_angle.pitch >= 0 ? local_angle.pitch : -local_angle.pitch) * 100) % 100,
-					(int32_t)local_angle.roll, (uint32_t)((local_angle.roll >= 0 ? local_angle.roll : -local_angle.roll) * 100) % 100,
-					stable_count, required_stable_samples, tol_i, tol_f, elapsed_time / 1000);
-			HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
+			// 初始化阶段状态输出（每500ms一次）
+			if (current_tick - status_last_print >= 500)
+			{
+				status_last_print = current_tick;
+				sprintf(uart_buffer, "INIT P:%ld.%02lu R:%ld.%02lu S:%3d/%3d T:%lus\r\n",
+						(int32_t)local_angle.pitch, (uint32_t)((local_angle.pitch >= 0 ? local_angle.pitch : -local_angle.pitch) * 100) % 100,
+						(int32_t)local_angle.roll, (uint32_t)((local_angle.roll >= 0 ? local_angle.roll : -local_angle.roll) * 100) % 100,
+						stable_count, required_stable_samples, elapsed_time / 1000);
+				HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
+			}
 		}
 		else
 		{
@@ -329,13 +335,19 @@ int main(void) {
 
 			// RC状态指示
 			const char *rc_status = g_rc_connected ? (g_rc_armed ? "ARM" : "DIS") : "NORC";
-			sprintf(uart_buffer, "BAT:%ld.%02ldV %s P:%ld.%02lu R:%ld.%02lu T:%d M:%4d %4d %4d %4d\r\n",
-			        bat_int, bat_frac, rc_status,
-			        (int32_t)local_angle.pitch, (uint32_t)((local_angle.pitch >= 0 ? local_angle.pitch : -local_angle.pitch) * 100) % 100,
-			        (int32_t)local_angle.roll, (uint32_t)((local_angle.roll >= 0 ? local_angle.roll : -local_angle.roll) * 100) % 100,
-			        g_base_throttle,
-			        m1, m2, m3, m4);
-			HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
+
+			// 状态行串口输出（每100ms一次，减少主循环阻塞）
+			if (current_tick - status_last_print >= status_print_interval)
+			{
+				status_last_print = current_tick;
+				sprintf(uart_buffer, "BAT:%ld.%02ldV %s P:%ld.%02lu R:%ld.%02lu T:%d M:%4d %4d %4d %4d\r\n",
+				        bat_int, bat_frac, rc_status,
+				        (int32_t)local_angle.pitch, (uint32_t)((local_angle.pitch >= 0 ? local_angle.pitch : -local_angle.pitch) * 100) % 100,
+				        (int32_t)local_angle.roll, (uint32_t)((local_angle.roll >= 0 ? local_angle.roll : -local_angle.roll) * 100) % 100,
+				        g_base_throttle,
+				        m1, m2, m3, m4);
+				HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 10);
+			}
 
 			// OLED显示（每200ms刷新一次）
 			uint32_t now = HAL_GetTick();

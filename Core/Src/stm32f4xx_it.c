@@ -63,7 +63,6 @@
 /* USER CODE BEGIN EV */
 extern TIM_HandleTypeDef htim3;
 extern UART_HandleTypeDef huart2;
-extern DMA_HandleTypeDef hdma_usart2_rx;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -216,32 +215,15 @@ void TIM3_IRQHandler(void)
 
 /**
   * @brief  USART2中断处理函数（i-BUS接收）
-  *         处理 RXNE(逐字节) + IDLE(帧边界) 中断
+  *         完全交给HAL框架处理RXNE+IDLE
   */
 void USART2_IRQHandler(void)
 {
-	/* 处理IDLE中断（帧间空闲检测）*/
+	/* IDLE帧边界检测 */
 	IBUS_ProcessIdle();
 
-	/* 处理RXNE中断：逐字节读取i-BUS数据 */
-	if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE))
-	{
-		uint8_t byte = (uint8_t)(huart2.Instance->DR & 0xFF);
-		IBUS_OnRxByte(byte);
-	}
-
-	/* 清除可能的错误标志防止死锁*/
-	__HAL_UART_CLEAR_OREFLAG(&huart2);
-
+	/* 其余全交给HAL处理（包括RXNE→RxCpltCallback）*/
 	HAL_UART_IRQHandler(&huart2);
-}
-
-/**
-  * @brief  DMA1 Stream5中断处理函数（USART2_RX DMA传输完成）
-  */
-void DMA1_Stream5_IRQHandler(void)
-{
-    HAL_DMA_IRQHandler(&hdma_usart2_rx);
 }
 
 /**
