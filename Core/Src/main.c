@@ -62,6 +62,11 @@ volatile uint8_t  g_auto_landing_in_progress = 0; // 自动降落中
 volatile uint32_t g_landing_start_time = 0;   // 降落开始时间
 volatile uint8_t  g_low_battery_triggered = 0;// 低电压触发标志
 
+// 油门保护参数
+#define THROTTLE_MAX_LIMIT    1500            // 油门上限限制
+#define THROTTLE_RAMP_MS      2000u           // 启动防冲缓升时间（2秒）
+volatile uint32_t g_arm_start_time = 0;       // 解锁时刻记录
+
 // RC遥控器共享变量（主循环写，ISR读）
 volatile float    g_rc_pitch_target = 0.0f;   // 目标俯仰角（度）
 volatile float    g_rc_roll_target = 0.0f;    // 目标翻滚角（度）
@@ -221,11 +226,33 @@ int main(void) {
 			                    (IBUS_CH_MAX - IBUS_CH_CENTER) * RC_MAX_ANGLE;
 
 			// 解锁开关: CH5 > 1500 = 解锁
+			uint8_t prev_armed = g_rc_armed;
 			g_rc_armed = (ch_arm > 1500) ? 1 : 0;
 
-			// 油门（仅解锁时生效）
+			// 检测解锁上升沿，记录时刻
+			if (g_rc_armed && !prev_armed)
+			{
+				g_arm_start_time = current_tick;
+			}
+
+			// 油门处理（仅解锁时生效）
 			if (g_rc_armed) {
-				g_base_throttle = ch_throttle;
+				// 油门行程上限限制
+				if (ch_throttle > THROTTLE_MAX_LIMIT) ch_throttle = THROTTLE_MAX_LIMIT;
+
+				// 启动防冲：油门从1000缓升到目标值
+				uint32_t armed_elapsed = current_tick - g_arm_start_time;
+				if (armed_elapsed < THROTTLE_RAMP_MS)
+				{
+					// 线性缓升: ramp_ratio 从 0→1
+					float ramp_ratio = (float)armed_elapsed / (float)THROTTLE_RAMP_MS;
+					uint16_t ramp_throttle = 1000 + (uint16_t)((float)(ch_throttle - 1000) * ramp_ratio);
+					g_base_throttle = ramp_throttle;
+				}
+				else
+				{
+					g_base_throttle = ch_throttle;
+				}
 			} else {
 				g_base_throttle = 1000;
 			}
